@@ -318,6 +318,25 @@ func (r *GameServerSetReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return reconcile.Result{}, nil
 	}
 
+	// A gated rollout owns the effective ASTS partition while it is active.
+	if handled, result, gatedErr := r.reconcileGatedUpdate(ctx, gss, asts, podList.Items); handled {
+		span.SetAttributes(tracing.AttrReconcileAction("gated_update"))
+		if gatedErr != nil {
+			logger.Error(gatedErr, "failed to reconcile ServiceQuality-gated update")
+			span.RecordError(gatedErr)
+			span.SetStatus(codes.Error, "failed to reconcile ServiceQuality-gated update")
+			return reconcile.Result{}, gatedErr
+		}
+		if err = gsm.SyncStatus(ctx); err != nil {
+			logger.Error(err, "failed to sync GameServerSet status during gated update")
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "failed to sync GameServerSet status during gated update")
+			return reconcile.Result{}, err
+		}
+		span.SetStatus(codes.Ok, "ServiceQuality-gated update reconciled")
+		return result, nil
+	}
+
 	// update workload
 	if gsm.IsNeedToUpdateWorkload() {
 		span.SetAttributes(tracing.AttrReconcileAction("update_workload"))
@@ -398,6 +417,9 @@ func (r *GameServerSetReconciler) initAsts(ctx context.Context, gss *gamekruisei
 	}
 
 	asts = util.GetNewAstsFromGss(gss.DeepCopy(), asts)
+	if util.HasCompletionPolicy(gss) {
+		asts.Annotations[gatedTemplateHashKey] = util.GetHash(asts.Spec.Template)
+	}
 
 	return r.Create(ctx, asts)
 }

@@ -186,6 +186,17 @@ func (manager *GameServerSetManager) GameServerScale(ctx context.Context) error 
 	asts.Spec.ScaleStrategy = &kruiseV1beta1.StatefulSetScaleStrategy{
 		MaxUnavailable: gss.Spec.ScaleStrategy.MaxUnavailable,
 	}
+	if gss.Status.UpdateProgress != nil &&
+		gss.Spec.UpdateStrategy.RollingUpdate != nil && gss.Spec.UpdateStrategy.RollingUpdate.CompletionPolicy != nil &&
+		asts.Spec.UpdateStrategy.RollingUpdate != nil && asts.Spec.UpdateStrategy.RollingUpdate.Partition != nil {
+		if util.IsServiceQualityGatedUpdateActive(gss) {
+			target := ptr.Deref(gss.Spec.UpdateStrategy.RollingUpdate.Partition, 0)
+			partition := gatedPartitionAfterScale(int32(currentReplicas), *asts.Spec.UpdateStrategy.RollingUpdate.Partition, int32(expectedReplicas), target)
+			asts.Spec.UpdateStrategy.RollingUpdate.Partition = ptr.To(partition)
+		} else if *asts.Spec.UpdateStrategy.RollingUpdate.Partition > int32(expectedReplicas) {
+			asts.Spec.UpdateStrategy.RollingUpdate.Partition = ptr.To(int32(expectedReplicas))
+		}
+	}
 	err := c.Update(ctx, asts)
 	if err != nil {
 		logger.Error(err, "failed to update workload replicas")
@@ -400,6 +411,12 @@ func (manager *GameServerSetManager) UpdateWorkload(ctx context.Context) error {
 		asts = util.GetNewAstsFromGss(gss.DeepCopy(), asts)
 		astsAns := asts.GetAnnotations()
 		astsAns[gameKruiseV1alpha1.AstsHashKey] = newHash
+		if util.HasCompletionPolicy(gss) {
+			astsAns[gatedTemplateHashKey] = util.GetHash(asts.Spec.Template)
+		} else {
+			// A stale fingerprint must not start a rollout when a policy is added later.
+			delete(astsAns, gatedTemplateHashKey)
+		}
 		asts.SetAnnotations(astsAns)
 
 		return manager.client.Update(ctx, asts)
@@ -575,13 +592,45 @@ func (manager *GameServerSetManager) SyncStatus(ctx context.Context) error {
 		LabelSelector:           asts.Status.LabelSelector,
 		ObservedGeneration:      gss.GetGeneration(),
 	}
-	if equality.Semantic.DeepEqual(gss.Status, status) {
+	if !util.HasCompletionPolicy(gss) {
+		// Ignore gated metadata when comparing counters, without including it
+		// in the legacy patch below.
+		comparisonStatus := status
+		comparisonStatus.UpdateProgress = gss.Status.UpdateProgress
+		comparisonStatus.Conditions = gss.Status.Conditions
+		if equality.Semantic.DeepEqual(gss.Status, comparisonStatus) {
+			return nil
+		}
+		patchStatus := map[string]interface{}{"status": status}
+		jsonPatch, err := json.Marshal(patchStatus)
+		if err != nil {
+			return err
+		}
+		return c.Status().Patch(ctx, gss, client.RawPatch(types.MergePatchType, jsonPatch))
+	}
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		current := &gameKruiseV1alpha1.GameServerSet{}
+		if err := c.Get(ctx, client.ObjectKeyFromObject(gss), current); err != nil {
+			return err
+		}
+		if current.Generation != gss.Generation {
+			return nil // A newer GSS update will reconcile its own status.
+		}
+		status.UpdateProgress = current.Status.UpdateProgress
+		status.Conditions = current.Status.Conditions
+		if equality.Semantic.DeepEqual(current.Status, status) {
+			gss.Status = current.Status
+			gss.ResourceVersion = current.ResourceVersion
+			return nil
+		}
+		current.Status = status
+		// A full update includes the CRD-required replica counters even when
+		// they are zero; retry preserves progress written earlier in this cycle.
+		if err := c.Status().Update(ctx, current); err != nil {
+			return err
+		}
+		gss.Status = current.Status
+		gss.ResourceVersion = current.ResourceVersion
 		return nil
-	}
-	patchStatus := map[string]interface{}{"status": status}
-	jsonPatch, err := json.Marshal(patchStatus)
-	if err != nil {
-		return err
-	}
-	return c.Status().Patch(ctx, gss, client.RawPatch(types.MergePatchType, jsonPatch))
+	})
 }
